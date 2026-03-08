@@ -2,23 +2,44 @@
 Focus Fitness Marketing Agent
 Levittown, PA | Strength Training | No Bullshit.
 
-An expert marketing agent powered by Claude Opus 4.6.
-Run it and ask it anything about your marketing.
+Powered by Claude Opus 4.6 with adaptive thinking + web search.
+Run: python3 marketing_agent.py
 """
 
 import json
 import os
-import anthropic
-from anthropic import beta_tool
+import sys
+import threading
+import time
+import itertools
 from datetime import datetime
+from pathlib import Path
+import anthropic
+
+# ── Paths ────────────────────────────────────────────────────────────────────
+REPO_DIR   = Path(__file__).parent
+PLANS_DIR  = REPO_DIR / "plans"
+DATA_DIR   = REPO_DIR / "data"
+HISTORY_FILE = DATA_DIR / "history.json"
+PLANS_DIR.mkdir(exist_ok=True)
+DATA_DIR.mkdir(exist_ok=True)
+
+# ── ANSI colors ───────────────────────────────────────────────────────────────
+RESET  = "\033[0m"
+BOLD   = "\033[1m"
+CYAN   = "\033[96m"
+GREEN  = "\033[92m"
+YELLOW = "\033[93m"
+DIM    = "\033[2m"
 
 client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
-# ── Business context injected into every tool call ──────────────────────────
+# ── Business context ──────────────────────────────────────────────────────────
 BUSINESS = {
     "name": "Focus Fitness",
     "location": "Levittown, PA",
     "zip_codes": ["19054", "19055", "19056", "19057", "19058"],
+    "nearby": ["Bristol PA", "Fairless Hills PA", "Tullytown PA", "Penndel PA"],
     "services": ["personal training", "group strength classes"],
     "focus": "strength training",
     "brand_voice": "No bullshit. Efficient hard work. No gimmicks.",
@@ -27,10 +48,10 @@ BUSINESS = {
     "usp": "Real strength training in Levittown with zero gimmicks. You work hard, you get results.",
 }
 
-SYSTEM_PROMPT = f"""You are an elite marketing strategist and copywriter specializing in local fitness businesses.
-You have 20+ years of experience across digital advertising, brand building, social media, direct response copywriting,
-and community-based marketing. You have helped hundreds of independent gyms, personal trainers, and strength coaches
-grow their businesses from scratch.
+SYSTEM_PROMPT = f"""You are an elite marketing strategist and direct-response copywriter specializing in local fitness businesses.
+You have 20+ years of experience across digital advertising, brand building, social media, email marketing,
+community-based marketing, and retention strategy. You have helped hundreds of independent gyms, personal
+trainers, and strength coaches grow their businesses from scratch with tight budgets.
 
 Your client is {BUSINESS['name']} in {BUSINESS['location']}.
 - Services: {', '.join(BUSINESS['services'])}
@@ -38,48 +59,82 @@ Your client is {BUSINESS['name']} in {BUSINESS['location']}.
 - Brand voice: {BUSINESS['brand_voice']}
 - Target audience: Adults {BUSINESS['target_age']} in Levittown who want to get genuinely stronger
 - Monthly marketing budget: ${BUSINESS['monthly_budget']}
+- Nearby areas to target: {', '.join(BUSINESS['nearby'])}
 
-Your expertise includes:
-- Facebook & Instagram ad strategy and copywriting
-- Google Business Profile optimization
-- Local SEO
-- Direct response copywriting (headlines, hooks, CTAs)
+Your deep expertise includes:
+- Facebook & Instagram ad strategy, targeting, and copywriting
+- Google Business Profile optimization and local SEO
+- Direct response copywriting (headlines, hooks, CTAs, email, SMS)
 - Content calendars and organic social media strategy
-- Email and SMS marketing
+- Email drip sequences and SMS follow-up systems
 - Referral and retention programs
 - Seasonal promotions and campaign planning
-- Competitor and market analysis
-- Brand positioning for independent gyms
-- Pricing strategy
+- Competitor and market analysis (use web search when relevant)
+- Brand positioning for independent gyms against big-box competitors
+- Pricing strategy and value ladders
 - Community building and word-of-mouth amplification
+- ROI tracking and budget allocation
 
 You think like a performance marketer but write like a human being.
 You always match the client's voice: direct, confident, no fluff.
-When you use tools, you combine their outputs into a cohesive, actionable recommendation.
-You never recommend spending money the client doesn't have.
-You prioritize high-ROI, low-cost tactics first.
+When you use tools, combine their outputs into cohesive, actionable recommendations.
+Never recommend spending money the client doesn't have.
+Prioritize high-ROI, low-cost tactics first.
+Use web search when you need current competitor info, local market data, or industry trends.
 """
 
 
-# ── Tools ────────────────────────────────────────────────────────────────────
+# ── Persistence helpers ───────────────────────────────────────────────────────
 
-@beta_tool
-def generate_ad_copy(
-    platform: str,
-    goal: str,
-    tone: str = "direct and confident",
-    offer: str = "free first class",
-) -> str:
-    """
-    Generate high-converting ad copy for a specific platform.
+def load_history() -> list:
+    if HISTORY_FILE.exists():
+        try:
+            data = json.loads(HISTORY_FILE.read_text())
+            # Keep last 40 messages to avoid context overflow
+            return data[-40:] if len(data) > 40 else data
+        except Exception:
+            return []
+    return []
 
-    Args:
-        platform: The ad platform — e.g. 'Facebook', 'Instagram', 'Google'.
-        goal: What the ad should achieve — e.g. 'get new members', 'promote group class', 'build brand awareness'.
-        tone: The tone of the copy — e.g. 'direct and confident', 'motivational', 'no-nonsense'.
-        offer: The lead magnet or offer to include — e.g. 'free first class', '20% off first month'.
-    """
-    variations = {
+
+def save_history(history: list) -> None:
+    try:
+        HISTORY_FILE.write_text(json.dumps(history, indent=2, default=str))
+    except Exception:
+        pass
+
+
+# ── Spinner ───────────────────────────────────────────────────────────────────
+
+class Spinner:
+    def __init__(self, message: str = "Thinking"):
+        self._msg = message
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+
+    def _spin(self):
+        for frame in itertools.cycle("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"):
+            if self._stop.is_set():
+                break
+            sys.stdout.write(f"\r{DIM}{frame} {self._msg}...{RESET}")
+            sys.stdout.flush()
+            time.sleep(0.08)
+        sys.stdout.write("\r" + " " * 40 + "\r")
+        sys.stdout.flush()
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self._stop.set()
+        self._thread.join()
+
+
+# ── Tool functions ────────────────────────────────────────────────────────────
+
+def generate_ad_copy(platform: str, goal: str, tone: str = "direct and confident", offer: str = "free first class") -> str:
+    copies = {
         "Facebook": [
             f"Tired of gyms full of machines you don't need and trainers who don't push you?\n\n"
             f"Focus Fitness in Levittown is different.\n\n"
@@ -92,525 +147,1072 @@ def generate_ad_copy(
             f"in Levittown, 10 minutes from your front door.\n\n"
             f"Personal training & group classes. No gimmicks.\n\n"
             f"➡ {offer.capitalize()} — no credit card, no commitment.",
+
+            f"Here's the truth most gyms won't tell you:\n\n"
+            f"Cardio won't make you strong. Machines won't make you strong. "
+            f"A program that actually progresses you will.\n\n"
+            f"That's Focus Fitness. Levittown, PA.\n\n"
+            f"→ {offer.capitalize()}. No BS, no upsells.",
         ],
         "Instagram": [
             f"Strong is not a look. It's a lifestyle.\n\n"
-            f"@focusfitness_levittown — strength training that actually works.\n"
-            f"Link in bio → {offer}.",
+            f"Strength training in Levittown, PA 📍\n"
+            f"Personal training + group classes.\n\n"
+            f"DM us for your {offer}.",
 
             f"You don't need more motivation. You need a coach and a barbell.\n\n"
-            f"Levittown, PA 📍 | Personal training + group classes\n"
-            f"DM us for your {offer}.",
+            f"Levittown, PA 📍 | No gimmicks. No machines. No mirrors.\n\n"
+            f"First class free → link in bio.",
+
+            f"We're not for everyone.\n\n"
+            f"We're for people who want to actually get stronger.\n\n"
+            f"📍 Levittown PA | Strength training done right\n"
+            f"→ {offer.capitalize()}. DM us.",
         ],
         "Google": [
-            f"Strength Training in Levittown PA | No Fluff, Real Results",
-            f"Personal Trainer Levittown PA | {offer.capitalize()} | Focus Fitness",
+            f"Strength Training Levittown PA | Personal Trainer | {offer.capitalize()} | Focus Fitness",
+            f"Personal Trainer Near Me Levittown | Real Results, No Gimmicks | {offer.capitalize()}",
+            f"Best Gym Levittown PA | Strength Classes & Personal Training | Focus Fitness",
         ],
     }
-    copies = variations.get(platform, variations["Facebook"])
     result = {
         "platform": platform,
         "goal": goal,
         "offer": offer,
-        "ad_copies": copies,
-        "notes": (
-            f"Use the copy that matches your current goal: {goal}. "
-            f"A/B test both versions for 7 days and keep the one with more clicks/leads. "
-            f"Always include a clear call-to-action."
-        ),
+        "ad_copies": copies.get(platform, copies["Facebook"]),
+        "ab_test_tip": "Run 2 variations simultaneously for 7 days. Kill the loser, double the winner's budget.",
+        "pro_tip": "Facebook: use Lead Ads (instant form) so prospects never leave the app. Always follow up within 1 hour.",
     }
     return json.dumps(result, indent=2)
 
 
-@beta_tool
-def build_content_calendar(
-    month: str,
-    posts_per_week: int = 4,
-    platforms: str = "Instagram, Facebook",
-) -> str:
-    """
-    Build a monthly social media content calendar with post ideas and themes.
-
-    Args:
-        month: The target month, e.g. 'March 2026'.
-        posts_per_week: How many posts per week to plan, typically 3-5.
-        platforms: Comma-separated list of platforms to include.
-    """
-    themes = [
-        ("Monday", "Motivation/Mindset", "Short tip or quote about why strength matters more than cardio"),
-        ("Tuesday", "Training Content", "Clip or photo of a member doing a big lift (with permission)"),
-        ("Wednesday", "Education", "'Why we train X movement' — teach something real about strength"),
-        ("Thursday", "Social Proof", "Member result, testimonial, or transformation story"),
-        ("Friday", "Community", "Behind the scenes — coach setup, class recap, gym culture"),
-        ("Saturday", "Offer/CTA", "Remind followers about free first class or current promotion"),
-        ("Sunday", "Engagement", "Question for followers: 'What's your favorite lift?' or poll"),
+def build_content_calendar(month: str, posts_per_week: int = 4, platforms: str = "Instagram, Facebook") -> str:
+    all_themes = [
+        ("Monday",    "Mindset/Hook",    "Bold statement or uncomfortable truth about fitness that stops the scroll"),
+        ("Tuesday",   "Training Clip",   "15-30 sec raw video: member hitting a PR, coach cueing a lift, class energy"),
+        ("Wednesday", "Education",       "Teach one thing: 'Why the deadlift beats the leg press' or 'The only 3 lifts you need'"),
+        ("Thursday",  "Social Proof",    "Member milestone, testimonial, before/after, or PR board update"),
+        ("Friday",    "Behind the Scenes", "Coach setup, class recap, day-in-the-life — builds culture and trust"),
+        ("Saturday",  "Offer/CTA",       "Direct push: free first class, current promo, or referral program reminder"),
+        ("Sunday",    "Engagement",      "Question, poll, or challenge: 'What's your current deadlift PR?' or 'Tag someone who needs this'"),
     ]
-    weekly_plan = themes[:posts_per_week]
-    calendar = {
+    weekly_plan = all_themes[:posts_per_week]
+    return json.dumps({
         "month": month,
         "platforms": platforms,
         "posts_per_week": posts_per_week,
-        "weekly_themes": [
-            {"day": t[0], "theme": t[1], "post_idea": t[2]} for t in weekly_plan
+        "weekly_content_themes": [{"day": t[0], "theme": t[1], "idea": t[2]} for t in weekly_plan],
+        "monthly_arc": {
+            "week_1": "Introduce/reintroduce — who you are and what you stand for",
+            "week_2": "Education — teach your audience why strength training is the answer",
+            "week_3": "Social proof — results, member stories, PRs",
+            "week_4": "Conversion — push hard on your free first class offer",
+        },
+        "hashtag_sets": {
+            "local": "#LevittownPA #LevittownFitness #BristolPA #FairlessHills #BucksCountyFitness",
+            "niche": "#StrengthTraining #Powerlifting #BarbelTraining #GetStrong #LiftHeavy",
+            "broad": "#Fitness #PersonalTrainer #GymLife #FitLife #WorkoutMotivation",
+        },
+        "rules": [
+            "Raw > polished. Your phone camera is fine. Authenticity wins.",
+            "Stories daily. Feed posts 4x/week. Reels 1-2x/week.",
+            "Reply to every comment within 2 hours — the algorithm rewards it.",
+            "Never post without a CTA. Every post should have a next step.",
         ],
-        "monthly_campaigns": [
-            "Week 1 — Launch/Re-introduce: Who we are and what we stand for",
-            "Week 2 — Education week: 4 posts teaching strength training fundamentals",
-            "Week 3 — Social proof week: Member stories and results",
-            "Week 4 — Offer week: Push the free first class CTA hard",
-        ],
-        "content_tips": [
-            "Film every session if possible — raw, real footage outperforms polished stock photos.",
-            "Stories get 3x the engagement of feed posts on Instagram — use them daily.",
-            "Tag Levittown in every post. Local hashtags boost organic reach.",
-            "Reply to every comment within 2 hours — the algorithm rewards engagement.",
-        ],
-    }
-    return json.dumps(calendar, indent=2)
+    }, indent=2)
 
 
-@beta_tool
-def analyze_audience(
-    segment: str = "primary",
-) -> str:
-    """
-    Analyze the target audience segments for Focus Fitness.
-
-    Args:
-        segment: Which audience segment to analyze — 'primary', 'secondary', or 'all'.
-    """
+def analyze_audience(segment: str = "primary") -> str:
     segments = {
         "primary": {
-            "name": "Levittown Strength Seeker (35–55)",
-            "demographics": "Adults 35–55, Levittown PA, household income $60K–$120K",
+            "name": "The Lapsed Athlete (35–55)",
+            "demographics": "Adults 35–55, Levittown/Bucks County, $60K–$120K HHI, homeowners",
             "psychographics": [
+                "Was athletic in their 20s, let it slip",
                 "Tired of spinning their wheels at commercial gyms",
-                "Want real results, not entertainment",
-                "Value efficiency — 45-minute sessions that actually work",
-                "Skeptical of fad diets and trendy fitness classes",
-                "Motivated by progress they can measure (weight on the bar)",
+                "Wants real results, not entertainment or social fitness",
+                "Values efficiency — wants a 45-minute session that actually does something",
+                "Skeptical of fitness trends, fads, and supplements",
+                "Motivated by measurable progress (weight on the bar)",
             ],
             "pain_points": [
-                "Don't know how to program strength training correctly",
-                "Intimidated by powerlifting/barbell gyms",
-                "Busy schedule — can't commit to hour-long classes",
-                "Have tried and quit big-box gyms before",
+                "Doesn't know how to program strength training correctly",
+                "Has tried and quit big-box gyms multiple times",
+                "Busy — kids, job, commute — can't waste time on ineffective workouts",
+                "Slightly intimidated by barbell gyms but won't admit it",
             ],
-            "best_channels": ["Facebook Ads", "Google Search", "Word of mouth"],
-            "best_message": "Stop wasting time. Get strong. We'll show you exactly how.",
+            "best_channels": ["Facebook Ads", "Google Search", "Word of mouth from friends"],
+            "messaging_that_works": "Stop wasting time. Get strong. We show you exactly how.",
+            "messaging_to_avoid": "Transformation photos, before/afters (too salesy for this demo)",
         },
         "secondary": {
             "name": "Young Professional (25–35)",
-            "demographics": "Adults 25–35, commuters, first job, athletic background",
+            "demographics": "Adults 25–35, Levittown area, commuters, $45K–$80K income",
             "psychographics": [
-                "Athletic in high school/college, fell out of shape",
-                "Want to look and feel strong, not skinny",
-                "Social — will bring friends if they like the culture",
-                "Instagram-active, influenced by strength accounts",
+                "Was athletic in high school or college, fell off in their mid-20s",
+                "Wants to look and feel strong — not skinny, not bulky",
+                "Social — will bring friends if they love the culture",
+                "Instagram-active, influenced by strength/lifting content",
+                "Values community and belonging as much as results",
             ],
             "pain_points": [
-                "Expensive big-box gym memberships not worth it",
-                "Need accountability and coaching",
-                "Don't know where to start with barbell training",
+                "Expensive Planet Fitness membership they never use",
+                "Needs accountability and a coach to actually show up",
+                "Doesn't know how to start barbell training safely",
             ],
-            "best_channels": ["Instagram Ads", "TikTok (organic)", "Referrals"],
-            "best_message": "The gym you've been looking for. No machines. No mirrors. Just progress.",
+            "best_channels": ["Instagram Ads", "Referrals", "Organic social"],
+            "messaging_that_works": "The gym you've been looking for. No machines. No mirrors. Just progress.",
+        },
+        "tertiary": {
+            "name": "Over-50 New Starter (50–65)",
+            "demographics": "Adults 50–65, Levittown, often recently motivated by health scare or doctor's advice",
+            "psychographics": [
+                "Was told strength training is important for bone density, metabolism, longevity",
+                "Nervous about injury, needs to trust the coach completely",
+                "Responds to authority and expertise",
+                "Very loyal once they commit — low churn",
+            ],
+            "pain_points": [
+                "Scared of 'hardcore' gym culture",
+                "Has real physical limitations (knees, back)",
+                "Doesn't know where to start",
+            ],
+            "best_channels": ["Google Search", "Facebook", "Doctor referrals", "Community boards"],
+            "messaging_that_works": "Strength training designed for real people. Safe, coached, and effective.",
         },
     }
     if segment == "all":
-        result = segments
-    else:
-        result = segments.get(segment, segments["primary"])
-    return json.dumps(result, indent=2)
+        return json.dumps(segments, indent=2)
+    return json.dumps(segments.get(segment, segments["primary"]), indent=2)
 
 
-@beta_tool
-def create_offer(
-    goal: str,
-    season: str = "general",
-    budget_sensitive: bool = True,
-) -> str:
-    """
-    Design a promotional offer or lead magnet to attract new members.
-
-    Args:
-        goal: What the offer is trying to achieve — e.g. 'get new members', 'retain current members', 'reactivate lapsed members'.
-        season: The time of year or context — e.g. 'January', 'summer', 'back to school', 'general'.
-        budget_sensitive: Whether the offer must be free or very low cost to fulfill.
-    """
+def create_offer(goal: str, season: str = "general", budget_sensitive: bool = True) -> str:
     offers = {
         "get new members": [
             {
                 "name": "Free First Class",
-                "description": "Walk in, try a group class or personal training session for free. No signup, no credit card.",
-                "why_it_works": "Removes all risk. 80% of people who try once come back.",
-                "cost_to_you": "$0 (your time)",
-                "how_to_promote": "Facebook/Instagram ads, Google Business, word of mouth",
+                "description": "Walk in, try a group class or PT session free. No signup, no card.",
+                "why_it_works": "Removes all risk. Most people who try once come back.",
+                "cost": "$0",
+                "promote_via": "Facebook/Instagram Lead Ads, Google Business, word of mouth",
             },
             {
                 "name": "Bring a Friend Week",
-                "description": "Every current member can bring one guest for free for an entire week.",
-                "why_it_works": "Turns members into recruiters. Warm referrals convert at 5x cold leads.",
-                "cost_to_you": "$0",
-                "how_to_promote": "Text/email existing members, post in class",
+                "description": "Any current member can bring one guest free for a full week.",
+                "why_it_works": "Warm referrals convert at 5x the rate of cold ads.",
+                "cost": "$0",
+                "promote_via": "Text/DM all current members, announce in class",
             },
             {
-                "name": "30-Day New Member Challenge",
-                "description": "First month at a reduced rate ($99 instead of $149) if they attend at least 12 sessions.",
-                "why_it_works": "Creates commitment and habit. Members who hit 12 sessions almost never quit.",
-                "cost_to_you": "~$50 revenue reduction, offset by retention",
-                "how_to_promote": "Facebook ads targeting Levittown, landing page",
+                "name": "30-Day Commitment Challenge",
+                "description": "First month $99 (vs. $149) if they attend 12+ sessions in 30 days.",
+                "why_it_works": "Creates habit. Members who hit 12 sessions in month 1 almost never quit.",
+                "cost": "$50 revenue reduction — offset by lifetime value",
+                "promote_via": "Facebook Ads → landing page or Lead Ad form",
             },
         ],
         "retain current members": [
             {
-                "name": "Loyalty Milestone Rewards",
-                "description": "Hit 50, 100, 200 sessions — get a shirt, a free month, public recognition.",
-                "why_it_works": "Gamification keeps attendance high and creates social proof.",
-                "cost_to_you": "Shirt (~$15), 1 free month (~$149 value) — worth it for lifetime retention",
+                "name": "PR Board + Milestone Rewards",
+                "description": "Public PR board. At 50/100/200 sessions: free shirt, free month, public shoutout.",
+                "why_it_works": "Gamification creates emotional investment. Stopping feels like losing progress.",
+                "cost": "Shirt ~$15, free month ~$149 — tiny vs. member LTV",
+            },
+            {
+                "name": "Check-in Text",
+                "description": "Text any member who misses 2+ sessions: 'Hey [name], missed you this week. Everything ok?'",
+                "why_it_works": "Personal outreach stops churn before it starts. Most gyms never do this.",
+                "cost": "$0 — 2 minutes of your time",
+            },
+        ],
+        "reactivate lapsed members": [
+            {
+                "name": "Win-Back Offer",
+                "description": "Text or email lapsed members: 'We miss you. Come back for 2 weeks free, no questions asked.'",
+                "why_it_works": "They already know you. Re-acquisition cost is 5x lower than new member acquisition.",
+                "cost": "2 weeks free (~$70 value)",
             },
         ],
     }
-    result = {
+    return json.dumps({
         "goal": goal,
         "season": season,
         "recommended_offers": offers.get(goal, offers["get new members"]),
-        "golden_rule": (
-            "The best offer has zero friction to claim and zero risk to the prospect. "
-            "Never require a credit card upfront for a trial. "
-            "Your close rate on free trials is your real marketing metric — track it."
-        ),
-    }
-    return json.dumps(result, indent=2)
+        "golden_rule": "Zero friction to claim. Zero risk to the prospect. Never require a card for a trial.",
+    }, indent=2)
 
 
-@beta_tool
-def write_google_business_post(
-    topic: str,
-    include_cta: bool = True,
-) -> str:
-    """
-    Write a Google Business Profile post to boost local search visibility.
-
-    Args:
-        topic: The topic of the post — e.g. 'new class schedule', 'member result', 'strength tip', 'offer'.
-        include_cta: Whether to include a call-to-action button suggestion.
-    """
+def write_google_business_post(topic: str, include_cta: bool = True) -> str:
     posts = {
         "strength tip": (
             "The #1 mistake people make at the gym: too much variety, not enough consistency.\n\n"
-            "At Focus Fitness in Levittown, we build your strength on a foundation of "
-            "the big compound movements — squat, deadlift, press, row.\n\n"
-            "Show up. Work hard. Get stronger. Simple as that.\n\n"
+            "At Focus Fitness in Levittown, we build your strength on the fundamentals — "
+            "squat, deadlift, press, row. We progress them every week.\n\n"
+            "Show up. Work hard. Get stronger. That's the whole program.\n\n"
             "📍 Levittown, PA | Personal Training & Group Classes\n"
-            "First class is free — call or message us to schedule."
+            "First class free — call or DM us to schedule."
         ),
         "member result": (
-            "Another member PR at Focus Fitness 💪\n\n"
-            "This week, one of our members hit a new personal best on the deadlift after just 8 weeks of coaching.\n\n"
-            "No gimmicks. No complicated programming. Just consistent hard work and expert coaching.\n\n"
-            "If you're in Levittown and ready to actually get stronger, come try a class on us.\n"
-            "First session is free."
+            "New PR at Focus Fitness Levittown 💪\n\n"
+            "One of our members hit a new personal best on the deadlift this week — "
+            "after just 8 weeks of coaching. No magic, no gimmicks. Just showing up and working.\n\n"
+            "If you're in Levittown and want to actually get stronger, your first class is on us."
         ),
         "offer": (
             "New to Focus Fitness? Your first class is free.\n\n"
-            "We offer personal training and group strength classes right here in Levittown, PA.\n\n"
-            "No mirrors. No machines. No fluff. Just a coach, a barbell, and a plan that works.\n\n"
-            "Spots are limited — message us or call to claim your free session."
+            "We offer personal training and group strength classes in Levittown, PA.\n\n"
+            "No mirrors. No machines. No fluff. Just a coach, a barbell, and a plan.\n\n"
+            "Message us or call to claim your free session. Spots are limited."
         ),
-        "new class schedule": (
+        "class schedule": (
             "Updated class schedule now live at Focus Fitness Levittown!\n\n"
-            "We've added [TIME] slots to make it easier for you to train around your schedule.\n\n"
-            "Strength training. Small groups. Real results.\n\n"
+            "New time slots available to fit around your work schedule.\n\n"
+            "Strength training. Small groups. Real coaching.\n\n"
             "📞 Call or DM us to reserve your spot."
         ),
+        "why strength training": (
+            "Why strength training beats everything else as you get older:\n\n"
+            "→ Builds bone density\n"
+            "→ Boosts metabolism\n"
+            "→ Improves posture and reduces joint pain\n"
+            "→ Increases energy and confidence\n\n"
+            "Focus Fitness | Levittown, PA\n"
+            "Personal training & group classes. First class free."
+        ),
     }
-    content = posts.get(topic, posts["strength tip"])
-    result = {
-        "post_content": content,
+    return json.dumps({
+        "post_content": posts.get(topic, posts["strength tip"]),
         "cta_button": "Call now" if include_cta else None,
-        "posting_tips": [
-            "Post once per week minimum to stay active in Google's local algorithm.",
-            "Always include 'Levittown' and 'PA' naturally in the text for local SEO.",
-            "Add a photo to every post — posts with photos get 3x more views.",
+        "character_count": len(posts.get(topic, posts["strength tip"])),
+        "seo_tips": [
+            "Post minimum once per week — Google ranks active profiles higher.",
+            "Always include 'Levittown' and 'PA' naturally in the text.",
+            "Add a photo to every post — 3x more views.",
             "Respond to every Google review within 24 hours.",
+            "Use the 'What's New' post type for evergreen content.",
         ],
-    }
-    return json.dumps(result, indent=2)
+    }, indent=2)
 
 
-@beta_tool
-def plan_facebook_ad_campaign(
-    objective: str,
-    duration_days: int = 30,
-    monthly_budget: int = 120,
-) -> str:
-    """
-    Build a complete Facebook/Instagram ad campaign plan with targeting, budget allocation, and creative guidance.
-
-    Args:
-        objective: The campaign objective — e.g. 'lead generation', 'brand awareness', 'event promotion'.
-        duration_days: How long to run the campaign.
-        monthly_budget: Total monthly budget in dollars for Facebook/Instagram ads.
-    """
-    daily_budget = round(monthly_budget / 30, 2)
-    campaign = {
+def plan_facebook_ad_campaign(objective: str, duration_days: int = 30, monthly_budget: int = 120) -> str:
+    daily = round(monthly_budget / 30, 2)
+    return json.dumps({
         "objective": objective,
-        "platform": "Facebook + Instagram (same campaign)",
+        "platform": "Facebook + Instagram (same campaign, Meta Ads Manager)",
         "budget": {
-            "monthly": monthly_budget,
-            "daily": daily_budget,
-            "allocation": {
-                "prospecting_new_leads": f"${round(monthly_budget * 0.7)} (70%) — cold audience targeting",
-                "retargeting": f"${round(monthly_budget * 0.3)} (30%) — people who visited your profile/website",
+            "monthly_total": f"${monthly_budget}",
+            "daily": f"${daily}",
+            "split": {
+                "cold_prospecting": f"${round(monthly_budget * 0.7)} — new people who don't know you",
+                "warm_retargeting": f"${round(monthly_budget * 0.3)} — people who've interacted with your page/ads",
             },
         },
         "targeting": {
-            "locations": BUSINESS["zip_codes"] + ["Bristol PA", "Fairless Hills PA", "Tullytown PA"],
-            "radius": "5 miles around Levittown",
-            "age": "28–58",
+            "locations": BUSINESS["zip_codes"] + BUSINESS["nearby"],
+            "radius": "5 miles from Levittown center",
+            "age_range": "28–58",
             "interests": [
-                "Weightlifting",
-                "Strength training",
-                "Powerlifting",
-                "Barbell training",
-                "Physical fitness",
-                "CrossFit (people who want something better)",
+                "Weightlifting", "Strength training", "Powerlifting",
+                "Barbell training", "Physical fitness", "CrossFit",
+                "Men's Health magazine", "Muscle & Fitness",
             ],
-            "exclude": ["Planet Fitness employees", "Gold's Gym employees"],
-            "lookalike": "Upload your current member list to Facebook to build a lookalike audience",
+            "lookalike_audience": "Upload your current member list to Meta → create 1% lookalike audience in PA",
+            "exclusions": "Exclude people who already liked your page (unless retargeting campaign)",
         },
-        "ad_formats": [
-            {
-                "format": "Short video (15–30 sec)",
-                "when": "Week 1–2",
-                "content": "Raw training footage — a member hitting a big lift, coach cueing, real gym energy",
-                "why": "Video builds trust and stops the scroll",
-            },
-            {
-                "format": "Single image",
-                "when": "Week 3–4",
-                "content": "Before/after transformation or member PR milestone with short headline",
-                "why": "Images are cheaper per click and good for retargeting",
-            },
+        "creative_plan": [
+            {"week": "1-2", "format": "Video 15-30s", "content": "Raw training footage — real lifts, real people, no music overlay needed"},
+            {"week": "3-4", "format": "Single image", "content": "PR board, member milestone, or strong headline text overlay on gym photo"},
         ],
-        "testing_plan": "Run 2 ad variations simultaneously. After 7 days, kill the lower performer and double budget on the winner.",
+        "ad_copy_formula": "Pain → Agitation → Solution → CTA. Example: 'Tired of going to the gym and not getting stronger? [agitate] → Focus Fitness [solution] → First class free [CTA]'",
+        "testing": "Always run 2 ad variations. After 7 days, pause the loser. Scale the winner.",
         "kpis": {
-            "cost_per_lead_target": "$5–$15",
-            "click_through_rate_target": "1.5%+",
-            "lead_to_trial_conversion_target": "30%+",
+            "cost_per_lead": "$5–$15 (good), under $5 (great), over $20 (pause and retest)",
+            "ctr": "1.5%+ feed, 3%+ stories",
+            "lead_to_trial_rate": "30%+ (if lower, fix your follow-up speed)",
         },
-        "pro_tips": [
-            "Never boost posts — always use Ads Manager for real targeting control.",
-            "Use Facebook Lead Ads (instant form) so prospects never leave the app.",
-            "Follow up every lead within 1 hour — speed to contact is the #1 conversion factor.",
-            f"Start ads on Monday or Tuesday — CPMs are lower early in the week.",
+        "rules": [
+            "Use Lead Ads (instant form) — never send people to a website they'll abandon.",
+            "Follow up every lead within 1 hour. Every hour you wait, conversion drops 10x.",
+            "Never boost posts. Always use Ads Manager for targeting control.",
+            "Monday/Tuesday ads are cheaper — CPMs spike on weekends.",
         ],
+    }, indent=2)
+
+
+def write_referral_program(reward_type: str = "free month") -> str:
+    return json.dumps({
+        "program_name": "Bring Your People",
+        "tagline": "Get stronger together.",
+        "mechanism": {
+            "step_1": "Current member refers a friend",
+            "step_2": "Friend completes their first paid month",
+            "step_3": "BOTH get rewarded",
+        },
+        "rewards": {
+            "referrer": f"One free month ({reward_type}) — $149 value",
+            "new_member": "First month at 50% off",
+            "why_double_sided": "Double-sided rewards increase referral rates 3x vs. one-sided. The new member has more reason to sign up.",
+        },
+        "launch_plan": [
+            "1. Announce verbally in every class this week.",
+            "2. Text every current member: 'Hey [name] — we launched a referral program. Refer a friend who joins, you both get a free month. That's it.'",
+            "3. Post to Instagram + Facebook stories (not just feed).",
+            "4. Put a simple sign at the gym entrance.",
+        ],
+        "tracking": "Spreadsheet: member name | referred friend | date joined | reward given. Keep it simple.",
+        "who_to_ask_first": "Your 5 most enthusiastic members. Ask them personally. A warm ask converts 10x better than a mass text.",
+        "pro_tip": "Run 'Bring a Friend Week' quarterly — any member can bring a guest free for 7 days. Low commitment = high conversion.",
+    }, indent=2)
+
+
+def diagnose_marketing(area: str) -> str:
+    diagnoses = {
+        "low leads": {
+            "root_causes": [
+                "No compelling reason to try you over a cheaper gym",
+                "Google Business not fully optimized — you're invisible in local search",
+                "Ads targeting too broad, wrong age, or wrong message",
+                "No follow-up system — leads fall through the cracks",
+                "No referral program — your happiest members aren't working for you",
+            ],
+            "fix_this_week": [
+                "Check your Google Business — complete profile, add 5 recent photos, post something",
+                "Text every current member asking for one referral",
+                "Launch a Facebook Lead Ad with the free first class offer targeting Levittown zip codes",
+            ],
+            "fix_this_month": [
+                "Set up a lead response workflow: inquiry → call/text within 1 hour → book free trial → follow up 24hrs later",
+                "Get 10 Google reviews (text members a direct link to your review page)",
+                "Launch the referral program formally",
+            ],
+        },
+        "high churn": {
+            "root_causes": [
+                "Members aren't seeing progress — no visible tracking system",
+                "No community — members train alongside strangers, not a tribe",
+                "No check-in when they start missing sessions",
+                "Price objection — no mid-tier option between intro and full price",
+            ],
+            "fix_this_week": [
+                "Create a PR board — even a whiteboard creates emotional investment in staying",
+                "Call out every PR in class. Post them on social. Make progress visible.",
+                "Text every member who's missed 2+ sessions: 'Hey, missed you — everything ok?'",
+            ],
+        },
+        "low ad roi": {
+            "root_causes": [
+                "Boosting posts instead of using Ads Manager (kills targeting precision)",
+                "No A/B testing — running one ad and hoping",
+                "Follow-up too slow — leads go cold in under an hour",
+                "Landing in wrong audience — too broad, too old/young, wrong geography",
+            ],
+            "fix_this_week": [
+                "Kill all boosted posts. Move everything to Ads Manager.",
+                "Run 2 ad variations simultaneously — different headlines, same offer",
+                "Set a phone alarm to check and respond to leads every 2 hours during business hours",
+            ],
+        },
+        "weak social media": {
+            "root_causes": [
+                "Posting quotes and stock photos instead of real training footage",
+                "No consistent schedule — followers forget you exist",
+                "Every post is an ad — no value, no reason to follow",
+                "No call to action — people don't know what to do next",
+            ],
+            "fix_this_week": [
+                "Film 3 clips today during your next session. 15 seconds each, no editing.",
+                "Post one now with: 'This is what we do. First class free. DM us.'",
+                "Set phone reminders: post Mon/Wed/Fri/Sat — no exceptions for 30 days",
+            ],
+        },
+        "pricing": {
+            "market_rates": {
+                "group_class_membership": "$120–$160/month unlimited",
+                "personal_training": "$65–$95/session, or $250–$320/month (4 sessions)",
+                "intro_package": "$79–$129 for 2-3 sessions",
+            },
+            "recommendation": (
+                "Group membership: $139/month unlimited. "
+                "PT: $79/session or $299/month (4 sessions). "
+                "Intro offer: $99 for 2 sessions — low barrier, high commitment signal."
+            ),
+            "principle": "Price for the result, not the time. You're not selling 45-minute sessions. You're selling a stronger body.",
+        },
+    }
+    return json.dumps(diagnoses.get(area, {
+        "message": f"No preset diagnosis for '{area}'. Describe the problem in more detail and I'll give you a direct recommendation.",
+    }), indent=2)
+
+
+def write_email_sequence(trigger: str, num_emails: int = 3, goal: str = "convert to member") -> str:
+    sequences = {
+        "new_inquiry": [
+            {
+                "email": 1,
+                "timing": "Immediately (within 5 minutes of inquiry)",
+                "subject": "Your free class at Focus Fitness — here's what to know",
+                "body": (
+                    "Hey [Name],\n\n"
+                    "Thanks for reaching out. Your first class at Focus Fitness is free — no credit card, no commitment.\n\n"
+                    "Here's what to expect:\n"
+                    "→ Show up 10 minutes early\n"
+                    "→ Wear comfortable clothes and sneakers\n"
+                    "→ We'll go over your goals and get you started on the right movements\n\n"
+                    "Classes run [TIMES]. Which works best for you this week?\n\n"
+                    "Just reply to this email or text me at [PHONE].\n\n"
+                    "— [Coach Name]\n"
+                    "Focus Fitness, Levittown"
+                ),
+            },
+            {
+                "email": 2,
+                "timing": "Day 2 (if no reply)",
+                "subject": "Still have a spot for you",
+                "body": (
+                    "Hey [Name],\n\n"
+                    "Just following up — I still have your free class held.\n\n"
+                    "A lot of people are nervous their first time in a strength gym. That's normal. "
+                    "We coach every movement from scratch, regardless of your experience level.\n\n"
+                    "What's a good time this week?\n\n"
+                    "— [Coach Name]"
+                ),
+            },
+            {
+                "email": 3,
+                "timing": "Day 5 (final follow-up)",
+                "subject": "Last chance for your free class",
+                "body": (
+                    "Hey [Name],\n\n"
+                    "I don't want to keep blowing up your inbox — but I also don't want you to miss out.\n\n"
+                    "Your free class offer stands through [DATE]. After that I'll release the spot.\n\n"
+                    "If the timing isn't right or you have questions, just reply — no pressure.\n\n"
+                    "— [Coach Name]"
+                ),
+            },
+        ],
+        "post_trial": [
+            {
+                "email": 1,
+                "timing": "Same day, 2 hours after trial class",
+                "subject": "How'd it go?",
+                "body": (
+                    "Hey [Name],\n\n"
+                    "Great having you in today. How are you feeling?\n\n"
+                    "I think you'd be a great fit here. If you want to keep going, "
+                    "I'd love to get you started on a proper program.\n\n"
+                    "Membership is $139/month — no contracts, cancel anytime. "
+                    "Or grab a 4-session intro package at $99 if you want to try it out first.\n\n"
+                    "What do you want to do?\n\n"
+                    "— [Coach Name]"
+                ),
+            },
+            {
+                "email": 2,
+                "timing": "Day 3 (if no decision)",
+                "subject": "Quick question",
+                "body": (
+                    "Hey [Name],\n\n"
+                    "What's holding you back?\n\n"
+                    "I ask because most people who try one class tell me they loved it but then get busy. "
+                    "I get it. Life happens.\n\n"
+                    "If it's timing, cost, or anything else — just tell me. "
+                    "I'd rather work something out than lose you to a gym that won't give you the same results.\n\n"
+                    "— [Coach Name]"
+                ),
+            },
+            {
+                "email": 3,
+                "timing": "Day 7",
+                "subject": "Offer expires Friday",
+                "body": (
+                    "Hey [Name],\n\n"
+                    "Last one from me. Your intro pricing ($99 for 4 sessions) is good through Friday.\n\n"
+                    "If now's not the time, no worries — the door's always open.\n\n"
+                    "— [Coach Name]"
+                ),
+            },
+        ],
+        "lapsed_member": [
+            {
+                "email": 1,
+                "timing": "30 days after last visit",
+                "subject": "We miss you at Focus Fitness",
+                "body": (
+                    "Hey [Name],\n\n"
+                    "Haven't seen you in a while — just wanted to check in.\n\n"
+                    "No judgment here. Life gets in the way. "
+                    "But I know how hard you worked when you were coming in, and I'd love to have you back.\n\n"
+                    "Come back for 2 weeks free — no questions asked. Your membership picks back up after.\n\n"
+                    "Just reply and we'll set it up.\n\n"
+                    "— [Coach Name]"
+                ),
+            },
+        ],
+    }
+    emails = sequences.get(trigger, sequences["new_inquiry"])[:num_emails]
+    return json.dumps({
+        "trigger": trigger,
+        "goal": goal,
+        "sequence": emails,
+        "rules": [
+            "Speed matters most on email 1. Under 5 minutes = 2x conversion rate.",
+            "Short emails win. 100 words beats 400 words every time.",
+            "Always end with one clear question or one clear next step — not both.",
+            "Use their first name. Be direct. Write like a human, not a business.",
+        ],
+    }, indent=2)
+
+
+def write_sms_templates(stage: str) -> str:
+    templates = {
+        "initial_inquiry": [
+            "Hey [Name], it's [Coach] from Focus Fitness! Got your message. Your first class is free — when works this week? 💪",
+            "Hi [Name]! [Coach] here from Focus Fitness Levittown. Still have a spot open for your free class — Tue at 6pm or Sat at 9am work for you?",
+        ],
+        "trial_reminder": [
+            "Hey [Name] — just a reminder your free class is tomorrow at [TIME]. Wear comfy clothes, show up 10 min early. See you there! — [Coach]",
+            "Reminder: Focus Fitness free class today at [TIME]. 📍 [ADDRESS]. Any questions just text back. — [Coach]",
+        ],
+        "trial_followup": [
+            "Hey [Name], great having you in today! How are you feeling? Ready to get started? — [Coach] at Focus Fitness",
+            "Hey [Name]! [Coach] here. Loved having you in. If you're ready to commit, I've got a spot for you. Just reply YES and I'll send details.",
+        ],
+        "no_show": [
+            "Hey [Name], missed you today at Focus Fitness. Everything ok? Still want to get you in for your free class — any day this week work? — [Coach]",
+        ],
+        "lapsed_reactivation": [
+            "Hey [Name], it's [Coach] from Focus Fitness. Missed seeing you. Come back for 2 weeks free — no strings attached. Interested? Just reply YES.",
+        ],
+        "referral_ask": [
+            "Hey [Name]! Quick favor — know anyone in Levittown who wants to get stronger? Send them our way and you both get a free month. Just have them mention your name 💪",
+        ],
+    }
+    return json.dumps({
+        "stage": stage,
+        "templates": templates.get(stage, templates["initial_inquiry"]),
+        "rules": [
+            "Text within 5 minutes of any inquiry. After 1 hour, response rates drop by 80%.",
+            "Keep it under 160 characters when possible (one SMS segment).",
+            "Always identify yourself by name AND gym — they may not have your number saved.",
+            "One CTA per text. Don't ask multiple questions.",
+            "9am–8pm only. Never text before 8am or after 9pm.",
+        ],
+    }, indent=2)
+
+
+def calculate_roi(
+    monthly_ad_spend: float,
+    leads_per_month: int,
+    trial_rate_pct: float,
+    close_rate_pct: float,
+    avg_monthly_revenue: float,
+    avg_lifespan_months: float,
+) -> str:
+    trials = leads_per_month * (trial_rate_pct / 100)
+    new_members = trials * (close_rate_pct / 100)
+    revenue_per_member = avg_monthly_revenue * avg_lifespan_months
+    monthly_revenue_from_ads = new_members * avg_monthly_revenue
+    cac = monthly_ad_spend / new_members if new_members > 0 else float("inf")
+    ltv = revenue_per_member
+    ltv_cac_ratio = ltv / cac if cac > 0 else 0
+    monthly_roi_pct = ((monthly_revenue_from_ads - monthly_ad_spend) / monthly_ad_spend * 100) if monthly_ad_spend > 0 else 0
+    payback_months = cac / avg_monthly_revenue if avg_monthly_revenue > 0 else float("inf")
+
+    if ltv_cac_ratio >= 3:
+        assessment = "STRONG — scale up ad spend"
+    elif ltv_cac_ratio >= 1.5:
+        assessment = "DECENT — optimize conversion rates before scaling"
+    else:
+        assessment = "WEAK — fix follow-up speed and close rate before spending more"
+
+    return json.dumps({
+        "inputs": {
+            "monthly_ad_spend": f"${monthly_ad_spend}",
+            "leads_per_month": leads_per_month,
+            "trial_rate": f"{trial_rate_pct}%",
+            "close_rate": f"{close_rate_pct}%",
+            "avg_monthly_revenue_per_member": f"${avg_monthly_revenue}",
+            "avg_member_lifespan": f"{avg_lifespan_months} months",
+        },
+        "results": {
+            "trials_per_month": round(trials, 1),
+            "new_members_per_month": round(new_members, 1),
+            "customer_acquisition_cost_CAC": f"${round(cac, 2)}",
+            "lifetime_value_LTV": f"${round(ltv, 2)}",
+            "ltv_to_cac_ratio": round(ltv_cac_ratio, 2),
+            "monthly_revenue_from_ads": f"${round(monthly_revenue_from_ads, 2)}",
+            "monthly_roi": f"{round(monthly_roi_pct, 1)}%",
+            "payback_period": f"{round(payback_months, 1)} months",
+        },
+        "assessment": assessment,
+        "biggest_lever": (
+            "Trial-to-member close rate is usually the #1 lever — "
+            "improve follow-up speed (under 1 hour) and your close rate often doubles."
+            if close_rate_pct < 40
+            else "Focus on increasing leads — your conversion funnel is working well."
+        ),
+    }, indent=2)
+
+
+def respond_to_review(rating: int, sentiment: str, review_text: str) -> str:
+    if rating >= 4 or sentiment == "positive":
+        response = (
+            f"Thank you so much [Reviewer Name] — this means a lot to us! "
+            f"Comments like this are why we do what we do. "
+            f"Keep showing up and keep getting stronger. "
+            f"See you in the gym! — [Coach Name], Focus Fitness Levittown"
+        )
+        tips = [
+            "Like and reply to every positive review within 24 hours.",
+            "Thank them specifically for what they mentioned.",
+            "Keep it short — 2-4 sentences. Don't oversell.",
+        ]
+    elif rating <= 2 or sentiment == "negative":
+        response = (
+            f"Hi [Reviewer Name], thank you for the feedback — I take this seriously. "
+            f"I'd like to understand what happened and make it right. "
+            f"Please reach out to me directly at [PHONE/EMAIL] so we can talk. "
+            f"— [Coach Name], Focus Fitness Levittown"
+        )
+        tips = [
+            "Never argue or get defensive in a public review response.",
+            "Move the conversation offline immediately.",
+            "A professional, calm response to a negative review impresses future customers more than a 5-star review.",
+            "After resolving it, politely ask them to update their review.",
+        ]
+    else:
+        response = (
+            f"Thanks for the feedback [Reviewer Name] — we appreciate you sharing your experience. "
+            f"We're always working to improve. If there's anything specific we can do better, "
+            f"please reach out at [PHONE]. Hope to see you back soon! "
+            f"— [Coach Name], Focus Fitness Levittown"
+        )
+        tips = [
+            "For neutral reviews, acknowledge and invite them back.",
+            "Ask what you could have done better — shows you care.",
+        ]
+    return json.dumps({
+        "review_rating": rating,
+        "review_text": review_text,
+        "suggested_response": response,
+        "character_count": len(response),
+        "tips": tips,
+        "why_reviews_matter": "93% of people read reviews before choosing a local business. Responding to all reviews — especially negative ones — increases trust.",
+    }, indent=2)
+
+
+def plan_seasonal_campaign(season: str, goal: str = "new members") -> str:
+    campaigns = {
+        "new_year": {
+            "window": "Dec 26 – Jan 31",
+            "why": "Highest fitness intent of the year. People are making resolutions.",
+            "angle": "Not a resolution. A decision. Most gyms are selling motivation. Sell results.",
+            "offer": "January special: first month $99 (reg $139). Offer expires Jan 15.",
+            "channels": "Facebook/Instagram Ads ($100), flyers at local businesses ($20), Google Business posts",
+            "copy_hook": "Resolutions fail. Strength doesn't. Start 2026 the right way.",
+            "urgency": "Hard deadline Jan 15. Say it in every post and ad.",
+        },
+        "spring": {
+            "window": "March 1 – April 30",
+            "why": "People start thinking about summer. High motivation to look and feel better.",
+            "angle": "12 weeks to summer. Start now.",
+            "offer": "Spring Challenge: commit to 3x/week for 12 weeks. Track every lift. Show up.",
+            "channels": "Instagram Ads, organic content (transformation progress updates)",
+            "copy_hook": "Summer is 12 weeks away. That's enough time to get genuinely stronger. We'll show you how.",
+        },
+        "back_to_school": {
+            "window": "Aug 15 – Sep 15",
+            "why": "Kids are back in school. Parents have their mornings and afternoons back.",
+            "angle": "You got your time back. Use it.",
+            "offer": "September Strong Start: Join in September, skip the signup fee.",
+            "channels": "Facebook Ads (target parents 30–50), local Facebook groups",
+            "copy_hook": "The kids are back in school. You finally have time. Don't waste it.",
+        },
+        "summer": {
+            "window": "June – August",
+            "why": "Lower intent than Jan/spring, but good for retention and referrals.",
+            "angle": "Summer Bring-a-Friend campaign. Outdoor training content.",
+            "offer": "Summer Referral Blitz: refer a friend who joins, you both get 2 weeks free.",
+            "channels": "Organic social, member texts, in-gym signage",
+            "copy_hook": "Summer Strong. Bring your people.",
+        },
+        "holiday": {
+            "window": "Nov 15 – Dec 24",
+            "why": "Gift cards, New Year's pre-sell, and keeping current members engaged through the holidays.",
+            "angle": "Gift strength. And get ahead of January before prices go up.",
+            "offer": "Gift cards + pre-sell January memberships at January pricing in December.",
+            "channels": "Email to current members, organic social, Google Business",
+            "copy_hook": "The best gift you can give someone is strength. Gift cards available now.",
+        },
+    }
+    campaign = campaigns.get(season, campaigns["new_year"])
+    campaign["goal"] = goal
+    campaign["season"] = season
+    campaign["budget_suggestion"] = {
+        "ads": "$80–$100",
+        "print_flyers": "$20–$30",
+        "total": "$100–$130 (leaving buffer from $200 monthly budget)",
     }
     return json.dumps(campaign, indent=2)
 
 
-@beta_tool
-def write_referral_program(
-    reward_type: str = "free month",
-) -> str:
-    """
-    Design a referral program to turn current members into recruiters.
+def save_output(title: str, content: str) -> str:
+    safe_title = "".join(c if c.isalnum() or c in " -_" else "" for c in title).strip().replace(" ", "_")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    filename = f"{timestamp}_{safe_title}.md"
+    filepath = PLANS_DIR / filename
+    filepath.write_text(f"# {title}\n\n*Saved: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}*\n\n{content}\n")
+    return json.dumps({
+        "saved": True,
+        "file": str(filepath),
+        "message": f"Saved to plans/{filename}",
+    }, indent=2)
 
-    Args:
-        reward_type: What reward to offer referrers — e.g. 'free month', 'discount', 'cash', 'swag'.
-    """
-    program = {
-        "program_name": "Bring Your People",
-        "tagline": "You get stronger together. So do we.",
-        "how_it_works": [
-            "Step 1: Current member refers a friend who joins.",
-            "Step 2: Friend completes their first paid month.",
-            "Step 3: Both the member AND the new joiner get the reward.",
-        ],
-        "reward": {
-            "type": reward_type,
-            "referrer_gets": "One free month of membership ($149 value)",
-            "new_member_gets": "First month at 50% off",
-            "why_both": "Double-sided rewards increase referral rates by 3x vs. one-sided.",
+
+# ── Tool registry ─────────────────────────────────────────────────────────────
+
+TOOL_MAP = {
+    "generate_ad_copy":          generate_ad_copy,
+    "build_content_calendar":    build_content_calendar,
+    "analyze_audience":          analyze_audience,
+    "create_offer":              create_offer,
+    "write_google_business_post": write_google_business_post,
+    "plan_facebook_ad_campaign": plan_facebook_ad_campaign,
+    "write_referral_program":    write_referral_program,
+    "diagnose_marketing":        diagnose_marketing,
+    "write_email_sequence":      write_email_sequence,
+    "write_sms_templates":       write_sms_templates,
+    "calculate_roi":             calculate_roi,
+    "respond_to_review":         respond_to_review,
+    "plan_seasonal_campaign":    plan_seasonal_campaign,
+    "save_output":               save_output,
+}
+
+# User-defined tool schemas (JSON schema format for the Messages API)
+USER_TOOL_SCHEMAS = [
+    {
+        "name": "generate_ad_copy",
+        "description": "Generate 2-3 high-converting ad copy variations for a specific platform (Facebook, Instagram, or Google).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "platform": {"type": "string", "description": "Ad platform: 'Facebook', 'Instagram', or 'Google'"},
+                "goal": {"type": "string", "description": "Ad objective, e.g. 'get new members', 'promote group class'"},
+                "tone": {"type": "string", "description": "Tone of voice, default: 'direct and confident'"},
+                "offer": {"type": "string", "description": "Lead magnet/offer, e.g. 'free first class'"},
+            },
+            "required": ["platform", "goal"],
         },
-        "how_to_launch": [
-            "Announce it in class verbally this week.",
-            "Text all current members with a 2-sentence message: "
-            "'Hey [name], we just launched a referral program. Bring a friend who signs up and you both get a free month. Simple.'",
-            "Post it on Instagram and Facebook stories.",
-            "Put a small sign at the front of the gym.",
-        ],
-        "tracking": "Keep a simple spreadsheet: member name, friend name, date referred, date joined, reward given.",
-        "pro_tip": (
-            "Your best customers are your best salespeople. "
-            "Ask your 5 most enthusiastic members personally — word of mouth from a trusted friend "
-            "converts at 5–10x the rate of any ad."
-        ),
-    }
-    return json.dumps(program, indent=2)
-
-
-@beta_tool
-def diagnose_marketing(
-    area: str,
-) -> str:
-    """
-    Diagnose a specific marketing problem and give a direct recommendation.
-
-    Args:
-        area: The marketing area to diagnose — e.g. 'low leads', 'high churn', 'low ad ROI', 'weak social media', 'pricing'.
-    """
-    diagnoses = {
-        "low leads": {
-            "likely_causes": [
-                "No clear lead magnet or offer (why would someone try you vs. a big gym?)",
-                "Not enough local visibility — Google Business not optimized",
-                "Ads targeting too broad or wrong age group",
-                "No follow-up system for people who inquire but don't book",
-            ],
-            "fix_this_week": [
-                "Audit your Google Business Profile — make sure it's complete, has photos, and has an active post",
-                "Create a Facebook/Instagram lead ad with the free first class offer targeting Levittown zip codes",
-                "Text or DM every current member asking them to refer one person",
-            ],
-            "fix_this_month": [
-                "Set up a simple lead follow-up workflow: inquiry → text/call within 1 hour → book free trial",
-                "Get 10 Google reviews from current members (email them a direct link to your review page)",
-                "Launch the referral program",
-            ],
+    },
+    {
+        "name": "build_content_calendar",
+        "description": "Build a monthly social media content calendar with post ideas, themes, and hashtag sets.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "month": {"type": "string", "description": "Target month, e.g. 'April 2026'"},
+                "posts_per_week": {"type": "integer", "description": "Posts per week, typically 3-5"},
+                "platforms": {"type": "string", "description": "Comma-separated platforms, e.g. 'Instagram, Facebook'"},
+            },
+            "required": ["month"],
         },
-        "high churn": {
-            "likely_causes": [
-                "Members not seeing clear progress — no tracking system",
-                "No community feel — members don't know each other",
-                "Price objection — no value ladder between intro and full membership",
-            ],
-            "fix_this_week": [
-                "Start tracking every member's key lifts — even a simple whiteboard PR board creates emotional investment",
-                "Celebrate every PR publicly (post it, call it out in class)",
-                "Check in with any member who has missed 2+ sessions in a row",
-            ],
+    },
+    {
+        "name": "analyze_audience",
+        "description": "Get a deep profile of a target audience segment including demographics, psychographics, pain points, and messaging.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "segment": {"type": "string", "description": "'primary' (35-55), 'secondary' (25-35), 'tertiary' (50-65), or 'all'"},
+            },
+            "required": [],
         },
-        "weak social media": {
-            "likely_causes": [
-                "Posting stock photos or motivational quotes instead of real content",
-                "Inconsistent posting schedule",
-                "No clear call to action in posts",
-            ],
-            "fix_this_week": [
-                "Film 3 short clips of real training today — 15 seconds each, no editing needed",
-                "Post one today with the caption: 'This is what we do at Focus Fitness Levittown. First class free.'",
-                "Set a phone reminder to post every Monday, Wednesday, Friday, and Saturday",
-            ],
+    },
+    {
+        "name": "create_offer",
+        "description": "Design a promotional offer or lead magnet for a specific goal (new members, retention, or win-back).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "goal": {"type": "string", "description": "'get new members', 'retain current members', or 'reactivate lapsed members'"},
+                "season": {"type": "string", "description": "Time of year context, e.g. 'January', 'summer', 'general'"},
+                "budget_sensitive": {"type": "boolean", "description": "Whether the offer must be free or low-cost to fulfill"},
+            },
+            "required": ["goal"],
         },
-        "pricing": {
-            "benchmark": "Local independent gym PT rates: $60–$100/session. Group: $25–$40/class. Monthly memberships: $99–$179.",
-            "recommendation": (
-                "For a no-frills strength gym in Levittown: "
-                "Group class membership $129–$149/month unlimited, "
-                "PT starting at $75/session or $280/month (4 sessions). "
-                "Offer a 2-session intro package at $99 to lower the barrier."
-            ),
-            "pricing_principle": "Price for the value, not the cost. People pay for results and accountability, not just gym access.",
+    },
+    {
+        "name": "write_google_business_post",
+        "description": "Write an SEO-optimized Google Business Profile post to improve local search visibility.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "topic": {"type": "string", "description": "'strength tip', 'member result', 'offer', 'class schedule', or 'why strength training'"},
+                "include_cta": {"type": "boolean", "description": "Whether to include a CTA button suggestion"},
+            },
+            "required": ["topic"],
         },
-    }
-    result = diagnoses.get(area, {
-        "message": f"I don't have a canned diagnosis for '{area}', but here's what I'd do: "
-                   "describe the problem in more detail and I'll give you a direct recommendation.",
-    })
-    return json.dumps(result, indent=2)
-
-
-# ── Agent loop ────────────────────────────────────────────────────────────────
-
-TOOLS = [
-    generate_ad_copy,
-    build_content_calendar,
-    analyze_audience,
-    create_offer,
-    write_google_business_post,
-    plan_facebook_ad_campaign,
-    write_referral_program,
-    diagnose_marketing,
+    },
+    {
+        "name": "plan_facebook_ad_campaign",
+        "description": "Build a complete Facebook/Instagram ad campaign plan with targeting, budget split, creative direction, and KPIs.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "objective": {"type": "string", "description": "Campaign objective, e.g. 'lead generation', 'brand awareness'"},
+                "duration_days": {"type": "integer", "description": "Campaign length in days"},
+                "monthly_budget": {"type": "integer", "description": "Total monthly budget in dollars for FB/IG ads"},
+            },
+            "required": ["objective"],
+        },
+    },
+    {
+        "name": "write_referral_program",
+        "description": "Design a referral program with rewards, launch plan, and tracking system to turn members into recruiters.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reward_type": {"type": "string", "description": "Reward for referrers: 'free month', 'discount', 'cash', 'swag'"},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "diagnose_marketing",
+        "description": "Diagnose a specific marketing problem and get a prioritized list of fixes. Use when something isn't working.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "area": {"type": "string", "description": "'low leads', 'high churn', 'low ad roi', 'weak social media', or 'pricing'"},
+            },
+            "required": ["area"],
+        },
+    },
+    {
+        "name": "write_email_sequence",
+        "description": "Write a multi-email follow-up sequence for leads, post-trial prospects, or lapsed members.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "trigger": {"type": "string", "description": "'new_inquiry', 'post_trial', or 'lapsed_member'"},
+                "num_emails": {"type": "integer", "description": "Number of emails in the sequence (2-5)"},
+                "goal": {"type": "string", "description": "What the sequence should achieve"},
+            },
+            "required": ["trigger"],
+        },
+    },
+    {
+        "name": "write_sms_templates",
+        "description": "Write SMS templates for each stage of the lead-to-member journey.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "stage": {"type": "string", "description": "'initial_inquiry', 'trial_reminder', 'trial_followup', 'no_show', 'lapsed_reactivation', or 'referral_ask'"},
+            },
+            "required": ["stage"],
+        },
+    },
+    {
+        "name": "calculate_roi",
+        "description": "Calculate marketing ROI, customer acquisition cost (CAC), lifetime value (LTV), and payback period.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "monthly_ad_spend": {"type": "number", "description": "Total monthly ad spend in dollars"},
+                "leads_per_month": {"type": "integer", "description": "Number of leads generated per month"},
+                "trial_rate_pct": {"type": "number", "description": "Percentage of leads who book a trial (0-100)"},
+                "close_rate_pct": {"type": "number", "description": "Percentage of trials who become paying members (0-100)"},
+                "avg_monthly_revenue": {"type": "number", "description": "Average monthly revenue per member in dollars"},
+                "avg_lifespan_months": {"type": "number", "description": "Average member lifespan in months"},
+            },
+            "required": ["monthly_ad_spend", "leads_per_month", "trial_rate_pct", "close_rate_pct", "avg_monthly_revenue", "avg_lifespan_months"],
+        },
+    },
+    {
+        "name": "respond_to_review",
+        "description": "Write a professional, on-brand response to a Google or Facebook review (positive, negative, or neutral).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "rating": {"type": "integer", "description": "Star rating 1-5"},
+                "sentiment": {"type": "string", "description": "'positive', 'negative', or 'neutral'"},
+                "review_text": {"type": "string", "description": "The text of the review"},
+            },
+            "required": ["rating", "sentiment", "review_text"],
+        },
+    },
+    {
+        "name": "plan_seasonal_campaign",
+        "description": "Plan a marketing campaign around a specific season or fitness moment of the year.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "season": {"type": "string", "description": "'new_year', 'spring', 'summer', 'back_to_school', or 'holiday'"},
+                "goal": {"type": "string", "description": "What you want to achieve, e.g. 'new members', 'retention'"},
+            },
+            "required": ["season"],
+        },
+    },
+    {
+        "name": "save_output",
+        "description": "Save a marketing plan, ad copy, or any output to a markdown file in the plans/ directory.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Title for the file, e.g. 'April Content Calendar'"},
+                "content": {"type": "string", "description": "The full content to save"},
+            },
+            "required": ["title", "content"],
+        },
+    },
 ]
 
+# Server-side tools (executed by the API, not client-side)
+SERVER_TOOLS = [
+    {"type": "web_search_20260209", "name": "web_search"},
+]
 
-def run_agent(user_message: str, conversation_history: list | None = None) -> tuple[str, list]:
+ALL_TOOLS = SERVER_TOOLS + USER_TOOL_SCHEMAS
+
+
+# ── Streaming agentic loop ────────────────────────────────────────────────────
+
+def run_agent(user_message: str, history: list) -> tuple[str, list]:
     """
-    Run one turn of the marketing agent.
-    Returns (assistant_reply, updated_history).
+    Stream one full agent turn (may include multiple tool call rounds).
+    Prints text to terminal as it streams.
+    Returns (full_reply_text, updated_history).
     """
-    if conversation_history is None:
-        conversation_history = []
+    history.append({"role": "user", "content": user_message})
+    full_reply = ""
+    max_iterations = 10
 
-    conversation_history.append({"role": "user", "content": user_message})
+    for iteration in range(max_iterations):
+        current_block_type = None
+        turn_text = ""
 
-    runner = client.beta.messages.tool_runner(
-        model="claude-opus-4-6",
-        max_tokens=4096,
-        system=SYSTEM_PROMPT,
-        thinking={"type": "adaptive"},
-        tools=TOOLS,
-        messages=conversation_history,
-    )
+        with client.messages.stream(
+            model="claude-opus-4-6",
+            max_tokens=4096,
+            system=SYSTEM_PROMPT,
+            thinking={"type": "adaptive"},
+            tools=ALL_TOOLS,
+            messages=history,
+        ) as stream:
+            for event in stream:
+                etype = event.type
 
-    # Collect the full response by iterating the runner
-    final_message = None
-    for message in runner:
-        final_message = message
+                if etype == "content_block_start":
+                    cb = event.content_block
+                    current_block_type = getattr(cb, "type", None)
+                    if current_block_type == "tool_use":
+                        print(f"\n{CYAN}🔧 {cb.name}{RESET}", flush=True)
 
-    if final_message is None:
-        return "No response generated.", conversation_history
+                elif etype == "content_block_delta":
+                    delta = event.delta
+                    dtype = getattr(delta, "type", None)
+                    if dtype == "text_delta" and current_block_type == "text":
+                        print(delta.text, end="", flush=True)
+                        turn_text += delta.text
 
-    # Extract text from the response
-    reply_text = ""
-    for block in final_message.content:
-        if hasattr(block, "text"):
-            reply_text += block.text
+                elif etype == "content_block_stop":
+                    current_block_type = None
 
-    # Append assistant reply to history for multi-turn support
-    conversation_history.append({
-        "role": "assistant",
-        "content": reply_text or "[No text response]",
-    })
+            response = stream.get_final_message()
 
-    return reply_text, conversation_history
+        full_reply += turn_text
 
+        # Append this assistant turn to history
+        history.append({"role": "assistant", "content": response.content})
+
+        stop = response.stop_reason
+
+        if stop == "end_turn":
+            break
+
+        if stop == "pause_turn":
+            # Server-side tool loop hit its limit — re-send to continue
+            continue
+
+        if stop == "tool_use":
+            # Execute user-defined tools
+            tool_results = []
+            for block in response.content:
+                btype = getattr(block, "type", None)
+                if btype == "tool_use":
+                    fn = TOOL_MAP.get(block.name)
+                    if fn:
+                        with Spinner(f"Running {block.name}"):
+                            try:
+                                result = fn(**block.input)
+                            except Exception as exc:
+                                result = json.dumps({"error": str(exc)})
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result,
+                        })
+
+            if tool_results:
+                history.append({"role": "user", "content": tool_results})
+            continue
+
+        break  # unknown stop reason
+
+    return full_reply, history
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
-    print("\n" + "=" * 60)
-    print("  FOCUS FITNESS MARKETING AGENT")
-    print("  Levittown, PA | Strength Training | No Bullshit.")
-    print("=" * 60)
-    print("\nAsk me anything about your marketing.")
-    print("Examples:")
-    print("  - Write me a Facebook ad for new members")
-    print("  - Build a content calendar for April")
-    print("  - Design a referral program")
-    print("  - I'm not getting enough leads. What do I do?")
-    print("  - Plan my Facebook ad campaign for the month")
-    print("\nType 'quit' to exit.\n")
+    print(f"\n{BOLD}{'=' * 62}{RESET}")
+    print(f"{BOLD}  FOCUS FITNESS MARKETING AGENT{RESET}")
+    print(f"{DIM}  Levittown, PA | Strength Training | No Bullshit.{RESET}")
+    print(f"{BOLD}{'=' * 62}{RESET}")
+    print(f"\n{DIM}Plans saved to: {PLANS_DIR}{RESET}")
+    print(f"{DIM}Type 'new' to clear history. Type 'quit' to exit.{RESET}\n")
+    print(f"{YELLOW}What can I help you with?{RESET}")
+    print(f"{DIM}Examples: 'Write a Facebook ad' | 'Build April's content calendar'")
+    print(f"'What should I do about low leads?' | 'Plan my New Year campaign'")
+    print(f"'Calculate my ROI: $120/mo ads, 20 leads, 40% trial, 50% close, $139/mo, 14 mo avg'{RESET}\n")
 
-    history = []
+    history = load_history()
+    if history:
+        print(f"{DIM}(Resuming previous session — {len(history)} messages in memory){RESET}\n")
 
     while True:
         try:
-            user_input = input("You: ").strip()
+            user_input = input(f"{GREEN}You:{RESET} ").strip()
         except (KeyboardInterrupt, EOFError):
-            print("\nGoodbye.")
+            print(f"\n{DIM}Go get 'em.{RESET}")
             break
 
         if not user_input:
             continue
-        if user_input.lower() in ("quit", "exit", "bye"):
-            print("Go get 'em. No excuses.")
+
+        if user_input.lower() == "new":
+            history = []
+            save_history(history)
+            print(f"{DIM}History cleared. Fresh start.{RESET}\n")
+            continue
+
+        if user_input.lower() in ("quit", "exit", "bye", "q"):
+            print(f"{DIM}Go get 'em. No excuses.{RESET}")
             break
 
-        print("\nAgent: ", end="", flush=True)
-        reply, history = run_agent(user_input, history)
-        print(reply)
-        print()
+        print(f"\n{BOLD}Agent:{RESET} ", end="", flush=True)
+
+        try:
+            reply, history = run_agent(user_input, history)
+            save_history(history)
+        except anthropic.AuthenticationError:
+            print(f"\n{YELLOW}Set your API key: export ANTHROPIC_API_KEY=your_key{RESET}")
+        except anthropic.RateLimitError:
+            print(f"\n{YELLOW}Rate limited — wait a moment and try again.{RESET}")
+        except anthropic.APIError as exc:
+            print(f"\n{YELLOW}API error: {exc}{RESET}")
+
+        print("\n")
 
 
 if __name__ == "__main__":
