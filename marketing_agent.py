@@ -15,6 +15,7 @@ import itertools
 from datetime import datetime
 from pathlib import Path
 import anthropic
+import vagaro_sync
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 REPO_DIR   = Path(__file__).parent
@@ -869,6 +870,135 @@ def save_output(title: str, content: str) -> str:
     }, indent=2)
 
 
+# ── Vagaro tools ─────────────────────────────────────────────────────────────
+
+def vagaro_sync_clients() -> str:
+    """Pull the full client list from Vagaro and save it locally."""
+    try:
+        summary = vagaro_sync.sync(verbose=False)
+        return json.dumps({
+            "status": "success",
+            "total_clients": summary["total"],
+            "with_email": summary["with_email"],
+            "with_phone": summary["with_phone"],
+            "segments": summary["segments"],
+            "message": f"Synced {summary['total']} clients from Vagaro. {summary['with_email']} have email, {summary['with_phone']} have phone.",
+        }, indent=2)
+    except RuntimeError as e:
+        return json.dumps({
+            "status": "error",
+            "error": str(e),
+            "setup_instructions": [
+                "1. Contact Vagaro Enterprise Sales to enable API access ($10/month)",
+                "   https://support.vagaro.com/hc/en-us/categories/34949493949851",
+                "2. In Vagaro dashboard: Settings → Developers → APIs & Webhooks",
+                "3. Generate your API token",
+                "4. Set environment variable: export VAGARO_API_TOKEN=your_token_here",
+                "5. Try again",
+            ],
+        }, indent=2)
+
+
+def vagaro_get_segments() -> str:
+    """Show how clients are segmented (active, at-risk, lapsed, lost, etc.)."""
+    clients = vagaro_sync._load_local()
+    if not clients:
+        return json.dumps({"error": "No clients synced yet. Use vagaro_sync_clients first."})
+
+    segs = vagaro_sync.segment_clients(clients)
+    result = {
+        "total_clients": len(clients),
+        "segments": {},
+    }
+    for seg_name, members in segs.items():
+        result["segments"][seg_name] = {
+            "count": len(members),
+            "description": {
+                "active_recent":  "Visited in the last 30 days — your most engaged members",
+                "at_risk":        "Last visit 31-90 days ago — follow up NOW before they leave",
+                "lapsed":         "Last visit 91-365 days ago — win-back candidates",
+                "lost":           "No visit in over 1 year — long-shot win-back",
+                "never_visited":  "In system but no visits recorded — may be leads who never converted",
+                "high_value":     "Top 20% by total spend — treat these people like gold",
+                "no_email":       "No email on file — can only reach by phone",
+                "no_phone":       "No phone on file — can only reach by email",
+            }.get(seg_name, ""),
+            "sample": [
+                f"{c['first_name']} {c['last_name']} | {c.get('email','no email')} | last visit: {(c.get('last_visit') or 'unknown')[:10]}"
+                for c in members[:5]
+            ],
+        }
+    return json.dumps(result, indent=2)
+
+
+def vagaro_generate_outreach(segment_name: str, channel: str, template_name: str, limit: int = 0) -> str:
+    """
+    Generate personalized email or SMS messages for a client segment.
+
+    Args:
+        segment_name: 'active_recent', 'at_risk', 'lapsed', 'lost', 'never_visited', 'high_value'
+        channel: 'email' or 'sms'
+        template_name: 'win_back', 'referral_ask', 'check_in', 'new_promo'
+        limit: max number of messages to generate (0 = all)
+    """
+    result = json.loads(vagaro_sync.generate_outreach(segment_name, channel, template_name, limit))
+    if "error" in result:
+        return json.dumps(result, indent=2)
+
+    # Add compliance reminders
+    result["compliance_notes"] = {
+        "email": [
+            "CAN-SPAM: Every email must include your physical address and an unsubscribe link.",
+            "These are existing clients — sending to them is generally permitted under CAN-SPAM business relationship exemption.",
+            "Honor all unsubscribe requests within 10 business days.",
+        ],
+        "sms": [
+            "TCPA WARNING: You must have explicit written opt-in consent before sending marketing SMS.",
+            "If clients opted in when they signed up with Vagaro, you're covered — verify this.",
+            "Every SMS must include: 'Reply STOP to opt out'.",
+            "Recommended SMS hours: 9am–8pm local time only.",
+            "Consider using a service like Twilio, SimpleTexting, or Podium to manage SMS campaigns with compliance built in.",
+        ],
+    }.get(channel, [])
+
+    result["next_steps"] = {
+        "email": "Copy these messages into Mailchimp, Constant Contact, or your email provider. Import the CSV export for bulk sending.",
+        "sms": "Copy these into SimpleTexting, Podium, or Twilio. Always verify SMS consent before sending.",
+    }.get(channel, "")
+
+    return json.dumps(result, indent=2)
+
+
+def vagaro_export_csv(segment_name: str = "all") -> str:
+    """
+    Export a client segment to CSV for use with Mailchimp, Constant Contact, or SMS platforms.
+
+    Args:
+        segment_name: 'all', 'active_recent', 'at_risk', 'lapsed', 'lost', 'high_value', etc.
+    """
+    try:
+        seg = None if segment_name == "all" else segment_name
+        path = vagaro_sync.export_csv(segment_name=seg)
+        clients = vagaro_sync._load_local()
+        segs = vagaro_sync.segment_clients(clients)
+        count = len(segs.get(segment_name, clients)) if segment_name != "all" else len(clients)
+        return json.dumps({
+            "status": "success",
+            "file": path,
+            "records_exported": count,
+            "compatible_with": [
+                "Mailchimp (import CSV under Audience → Import contacts)",
+                "Constant Contact",
+                "Klaviyo",
+                "SimpleTexting (for SMS)",
+                "Podium",
+                "Any spreadsheet (Excel, Google Sheets)",
+            ],
+        }, indent=2)
+    except RuntimeError as e:
+        return json.dumps({"status": "error", "error": str(e)}, indent=2)
+
+
 # ── Tool registry ─────────────────────────────────────────────────────────────
 
 TOOL_MAP = {
@@ -886,6 +1016,11 @@ TOOL_MAP = {
     "respond_to_review":         respond_to_review,
     "plan_seasonal_campaign":    plan_seasonal_campaign,
     "save_output":               save_output,
+    # Vagaro CRM integration
+    "vagaro_sync_clients":       vagaro_sync_clients,
+    "vagaro_get_segments":       vagaro_get_segments,
+    "vagaro_generate_outreach":  vagaro_generate_outreach,
+    "vagaro_export_csv":         vagaro_export_csv,
 }
 
 # User-defined tool schemas (JSON schema format for the Messages API)
@@ -1063,6 +1198,42 @@ USER_TOOL_SCHEMAS = [
                 "content": {"type": "string", "description": "The full content to save"},
             },
             "required": ["title", "content"],
+        },
+    },
+    # ── Vagaro CRM ──
+    {
+        "name": "vagaro_sync_clients",
+        "description": "Pull all clients from Vagaro and save them locally. Run this first before using other Vagaro tools. Requires VAGARO_API_TOKEN environment variable.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "vagaro_get_segments",
+        "description": "Show how clients are grouped into segments: active, at-risk, lapsed, lost, high-value, etc. Use this to decide who to target for a campaign.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "vagaro_generate_outreach",
+        "description": "Generate personalized email or SMS messages for a specific client segment. Returns ready-to-send messages with the client's first name merged in.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "segment_name": {"type": "string", "description": "Segment to target: 'active_recent', 'at_risk', 'lapsed', 'lost', 'never_visited', or 'high_value'"},
+                "channel":      {"type": "string", "description": "'email' or 'sms'"},
+                "template_name":{"type": "string", "description": "'win_back', 'referral_ask', 'check_in', or 'new_promo'"},
+                "limit":        {"type": "integer", "description": "Max messages to generate. 0 = all clients in segment."},
+            },
+            "required": ["segment_name", "channel", "template_name"],
+        },
+    },
+    {
+        "name": "vagaro_export_csv",
+        "description": "Export a client segment to a CSV file compatible with Mailchimp, Constant Contact, or SMS platforms like SimpleTexting.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "segment_name": {"type": "string", "description": "Segment to export: 'all', 'at_risk', 'lapsed', 'active_recent', 'high_value', etc."},
+            },
+            "required": [],
         },
     },
 ]
